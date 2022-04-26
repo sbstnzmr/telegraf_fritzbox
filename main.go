@@ -1,10 +1,15 @@
-package fritzbox
+package main
 
 // fritzbox.go
 
+// Copyright 2022 Sebastian Zimmer, original code in main.go taken from
+// https://github.com/cite/telegraf_fritzbox/, original copyright
+// notice:
+//
 // Copyright 2019 Stefan Förster, original code in main.go taken from
 // https://github.com/ndecker/fritzbox_exporter, original copyright
 // notice:
+//
 // Copyright 2016 Nils Decker
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,26 +25,17 @@ package fritzbox
 // limitations under the License.
 
 import (
+	"bufio"
 	"fmt"
-	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/plugins/inputs"
-	upnp "github.com/ndecker/fritzbox_exporter/fritzbox_upnp"
 	"log"
+	"os"
+	"strconv"
+	"strings"
+
+	"sbstnzmr.de/fritz-status/upnp"
 )
 
-type Fritzbox struct {
-	Host string
-	Port uint16
-}
-
-type Metric struct {
-	Service string
-	Action  string
-	Result  string
-	Name    string
-}
-
-var metrics = []*Metric{
+var Actions = []*ServiceActions{
 	{
 		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
 		Action:  "GetTotalPacketsReceived",
@@ -64,6 +60,44 @@ var metrics = []*Metric{
 		Result:  "TotalBytesSent",
 		Name:    "bytes_sent",
 	},
+
+	{
+		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
+		Action:  "GetAddonInfos",
+		Result:  "ByteSendRate",
+		Name:    "bytes_send_rate",
+	},
+	{
+		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
+		Action:  "GetAddonInfos",
+		Result:  "ByteReceiveRate",
+		Name:    "bytes_receive_rate",
+	},
+	{
+		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
+		Action:  "GetAddonInfos",
+		Result:  "PacketSendRate",
+		Name:    "packet_send_rate",
+	},
+	{
+		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
+		Action:  "GetAddonInfos",
+		Result:  "PacketReceiveRate",
+		Name:    "packet_receive_rate",
+	},
+	{
+		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
+		Action:  "GetAddonInfos",
+		Result:  "NewX_AVM_DE_TotalBytesSent64",
+		Name:    "total_bytes_sent_64",
+	},
+	{
+		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
+		Action:  "GetAddonInfos",
+		Result:  "NewX_AVM_DE_TotalBytesReceived64",
+		Name:    "total_bytes_received_64",
+	},
+
 	{
 		Service: "urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1",
 		Action:  "GetCommonLinkProperties",
@@ -79,81 +113,143 @@ var metrics = []*Metric{
 	{
 		Service: "urn:schemas-upnp-org:service:WANIPConnection:1",
 		Action:  "GetStatusInfo",
+		Result:  "LastConnectionError",
+		Name:    "last_connection_error",
+	},
+	{
+		Service: "urn:schemas-upnp-org:service:WANIPConnection:1",
+		Action:  "GetStatusInfo",
 		Result:  "Uptime",
 		Name:    "uptime",
 	},
 }
 
-func (s *Fritzbox) Description() string {
-	return "a demo plugin"
+type Fritzbox struct {
+	Host string
+	Port uint16
 }
 
-func (s *Fritzbox) SampleConfig() string {
-	return `
-  ## Host and Port for FRITZ!Box UPnP service
-  host = fritz.box
-  port = 49000
-`
+type ServiceActions struct {
+	Service string
+	Action  string
+	Result  string
+	Name    string
 }
 
-func (s *Fritzbox) Gather(acc telegraf.Accumulator) error {
-	var host string
-	var port uint16
-	if s.Host == "" {
-		host = "fritz.box"
-	} else {
-		host = s.Host
-	}
-	if s.Port == 0 {
-		port = 49000
-	} else {
-		port = s.Port
-	}
+type Result struct {
+	Name  string
+	Value string
+}
 
-	root, err := upnp.LoadServices(host, port)
+type ServiceResults struct {
+	Name    string
+	Results []Result
+}
+
+func (r *Result) influxString() string {
+	// Format:
+	// some_int=23i
+	// some_float=32.3
+	// some_bool=false
+	// some_string="some string"
+	var res string
+
+	_, err := strconv.Atoi(r.Value)
 	if err != nil {
-		return fmt.Errorf("fritzbox: unable to load services: %v", err)
+		_, err := strconv.ParseFloat(r.Value, 64)
+		if err != nil {
+			res = fmt.Sprintf("\"%s\"", r.Value)
+		} else {
+			res = r.Value
+		}
+	} else {
+		res = fmt.Sprintf("%si", r.Value)
 	}
 
-	// remember what we already called
+	return fmt.Sprintf("%s=%s", r.Name, res)
+}
+
+func (sr *ServiceResults) influxString(bucket string, host string) string {
+	// Format:
+	// fritzbox,host="192.168.178.1",source=wan some_int=23i,some_float=32.3,some_bool=false,some_string="some string"
+	prefix := fmt.Sprintf("%s,host=\"%s\",source=%s ", bucket, host, sr.Name)
+	influxResults := make([]string, 0)
+	for _, r := range sr.Results {
+		if r.Value == "<nil>" {
+			continue
+		}
+		influxResults = append(influxResults, r.influxString())
+	}
+	metrics := strings.Join(influxResults, ",")
+
+	return prefix + metrics
+}
+
+func main() {
+
+	host := os.Getenv("FRITZBOX_HOST")
+	port, _ := strconv.ParseUint(os.Getenv("FRITZBOX_PORT"), 0, 16)
+	if host == "" {
+		host = "192.168.178.1"
+	}
+	if port == 0 {
+		port = 49000
+	}
+
+	root, err := upnp.LoadServices(host, uint16(port))
+	if err != nil {
+		log.Fatalf("fritzbox: unable to load services: %v/n", err)
+	}
+
+	//remember what we already called
 	var last_service string
 	var last_method string
 	var result upnp.Result
-	fields := make(map[string]interface{})
 
-	for _, m := range metrics {
-		if m.Service != last_service || m.Action != last_method {
-			service, ok := root.Services[m.Service]
-			if !ok {
-				// TODO
-				log.Println("W! Cannot find defined service %s", m.Service)
-				continue
-			}
-			action, ok := service.Actions[m.Action]
-			if !ok {
-				// TODO
-				log.Println("W! Cannot find defined action %s on service %s", m.Action)
-				continue
+	// https://github.com/influxdata/telegraf/blob/master/plugins/processors/execd/README.md
+	// https://github.com/influxdata/telegraf/tree/master/plugins/inputs/execd
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		// Block and wait for telegraf to signal for the next iteration
+		reader.ReadString('\n')
+
+		// Currently we only have wan stats, no need to split
+		var sr = ServiceResults{
+			Name:    "wan",
+			Results: make([]Result, 0),
+		}
+		for _, m := range Actions {
+			if m.Service != last_service || m.Action != last_method {
+				service, ok := root.Services[m.Service]
+				if !ok {
+					log.Printf("W! Cannot find defined service %s/n", m.Service)
+					continue
+				}
+				action, ok := service.Actions[m.Action]
+				if !ok {
+					log.Printf("W! Cannot find defined action %s on service %s/n", m.Action, m.Service)
+					continue
+				}
+
+				result, err = action.Call()
+				if err != nil {
+					log.Printf("E! Unable to call action %s on service %s: %v/n", m.Action, m.Service, err)
+					continue
+				}
+
+				// save service and action
+				last_service = m.Service
+				last_method = m.Action
 			}
 
-			result, err = action.Call()
-			if err != nil {
-				log.Println("E! Unable to call action %s on service %s: %v", m.Action, m.Service, err)
-				continue
+			r := Result{
+				Name:  m.Name,
+				Value: fmt.Sprint(result[m.Result]),
 			}
-
-			// save service and action
-			last_service = m.Service
-			last_method = m.Action
+			sr.Results = append(sr.Results, r)
 		}
 
-		fields[m.Name] = result[m.Result]
+		fmt.Println(sr.influxString("fritzbox", host))
 	}
-	acc.AddFields("fritzbox", fields, map[string]string{"host": host})
-
-	return nil
-}
-
-func init() {
-	inputs.Add("fritzbox", func() telegraf.Input { return &Fritzbox{} })
 }

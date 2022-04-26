@@ -1,4 +1,10 @@
-# telegraf\_fritzbox
+# telegraf_fritzbox
+
+## Overview
+
+Small dockerized fritzbox plugin for telegraf. It pulls data on `STDIN`
+
+# Original
 
 ## Overview
 
@@ -10,7 +16,7 @@ basic statistcis using UPnP (i.e. SOAP on port 49000) when configured to do so
 übertragen").
 
 The code borrows heavily from Nils Decker's excellent
-[fritzbox\_exporter](https://github.com/ndecker/fritzbox_exporter).
+[fritzbox_exporter](https://github.com/ndecker/fritzbox_exporter).
 
 ## Build
 
